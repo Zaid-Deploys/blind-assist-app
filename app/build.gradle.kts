@@ -10,7 +10,9 @@ android {
             minorApiLevel = 1
         }
     }
-
+    androidResources {
+        noCompress += "tflite"
+    }
     defaultConfig {
         applicationId = "com.example.blindassist"
         minSdk = 24
@@ -60,4 +62,8 @@ dependencies {
     implementation("androidx.camera:camera-view:1.4.1")
     // ML Kit Text Recognition (offline, on-device)
     implementation("com.google.mlkit:text-recognition:16.0.1")
+    // ML Kit Object Detection (offline, on-device)
+    implementation("com.google.mlkit:object-detection:17.0.2")
+    // TensorFlow Lite Task Vision (for EfficientDet object detection)
+    implementation("org.tensorflow:tensorflow-lite-task-vision:0.4.4")
 }

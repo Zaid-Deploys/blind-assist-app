@@ -2,8 +2,10 @@ package com.example.blindassist
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -15,7 +17,6 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -29,6 +30,9 @@ import com.example.blindassist.ui.theme.BlindAssistTheme
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.task.core.BaseOptions
+import org.tensorflow.lite.task.vision.detector.ObjectDetector
 import java.util.Locale
 import java.util.concurrent.Executors
 
@@ -85,6 +89,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            val text = latestRecognizedText.value
+            tts?.speak(
+                if (text.isNotBlank()) text else "No text detected yet",
+                TextToSpeech.QUEUE_FLUSH, null, null
+            )
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     override fun onDestroy() {
         tts?.stop()
         tts?.shutdown()
@@ -99,15 +115,26 @@ fun CameraScreen(
     latestRecognizedText: MutableState<String>,
     onSpeak: (String) -> Unit
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val recognizer = remember { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+    val textRecognizer = remember { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
 
-    Column(modifier = modifier.fillMaxSize()) {
+    val objectDetector = remember {
+        val options = ObjectDetector.ObjectDetectorOptions.builder()
+            .setBaseOptions(BaseOptions.builder().setNumThreads(4).build())
+            .setMaxResults(5)
+            .setScoreThreshold(0.5f)
+            .build()
+        ObjectDetector.createFromFileAndOptions(context, "model.tflite", options)
+    }
+
+    var lastSpokenDescription by remember { mutableStateOf("") }
+    var lastSpeakTime by remember { mutableStateOf(0L) }
+
+    Box(modifier = modifier.fillMaxSize()) {
         AndroidView(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
+            modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
                 val previewView = PreviewView(ctx)
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
@@ -125,18 +152,54 @@ fun CameraScreen(
                     imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy: ImageProxy ->
                         val mediaImage = imageProxy.image
                         if (mediaImage != null) {
+                            // OCR (only used on-demand via Volume Up, but keep updating in background)
                             val inputImage = InputImage.fromMediaImage(
                                 mediaImage, imageProxy.imageInfo.rotationDegrees
                             )
-                            recognizer.process(inputImage)
+                            textRecognizer.process(inputImage)
                                 .addOnSuccessListener { visionText ->
                                     if (visionText.text.isNotBlank()) {
                                         latestRecognizedText.value = visionText.text
                                     }
                                 }
-                                .addOnCompleteListener {
-                                    imageProxy.close()
+
+                            // Object detection -> continuous narration
+                            try {
+                                val bitmap = imageProxy.toBitmap()
+                                val rotated = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+                                val tensorImage = TensorImage.fromBitmap(rotated)
+                                val results = objectDetector.detect(tensorImage)
+
+                                if (results.isNotEmpty()) {
+                                    val width = rotated.width
+                                    val descriptions = results.mapNotNull { result ->
+                                        val category = result.categories.firstOrNull() ?: return@mapNotNull null
+                                        val label = category.label
+                                        val centerX = result.boundingBox.centerX()
+                                        val position = when {
+                                            centerX < width / 3 -> "on your left"
+                                            centerX > width * 2 / 3 -> "on your right"
+                                            else -> "ahead"
+                                        }
+                                        "$label $position"
+                                    }
+                                    val description = descriptions.joinToString(", ")
+
+                                    val now = System.currentTimeMillis()
+                                    if (description.isNotBlank() &&
+                                        description != lastSpokenDescription &&
+                                        now - lastSpeakTime > 3000
+                                    ) {
+                                        lastSpokenDescription = description
+                                        lastSpeakTime = now
+                                        onSpeak(description)
+                                    }
                                 }
+                            } catch (e: Exception) {
+                                // Ignore frame errors, keep going
+                            } finally {
+                                imageProxy.close()
+                            }
                         } else {
                             imageProxy.close()
                         }
@@ -152,20 +215,42 @@ fun CameraScreen(
             }
         )
 
-        Button(
-            onClick = {
-                val text = latestRecognizedText.value
-                if (text.isNotBlank()) {
-                    onSpeak(text)
-                } else {
-                    onSpeak("No text detected yet")
-                }
-            },
+        Box(
             modifier = Modifier
+                .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(16.dp)
+                .padding(24.dp),
+            contentAlignment = Alignment.Center
         ) {
-            Text("Read Text")
+            Text("Auto-narrating surroundings | Volume Up: Read Text")
         }
     }
+}
+
+fun rotateBitmap(bitmap: Bitmap, degrees: Int): Bitmap {
+    if (degrees == 0) return bitmap
+    val matrix = android.graphics.Matrix()
+    matrix.postRotate(degrees.toFloat())
+    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+}
+
+fun ImageProxy.toBitmap(): Bitmap {
+    val yBuffer = planes[0].buffer
+    val uBuffer = planes[1].buffer
+    val vBuffer = planes[2].buffer
+
+    val ySize = yBuffer.remaining()
+    val uSize = uBuffer.remaining()
+    val vSize = vBuffer.remaining()
+
+    val nv21 = ByteArray(ySize + uSize + vSize)
+    yBuffer.get(nv21, 0, ySize)
+    vBuffer.get(nv21, ySize, vSize)
+    uBuffer.get(nv21, ySize + vSize, uSize)
+
+    val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
+    val out = java.io.ByteArrayOutputStream()
+    yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+    val imageBytes = out.toByteArray()
+    return android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
 }
