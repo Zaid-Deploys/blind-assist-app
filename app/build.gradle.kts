@@ -64,6 +64,6 @@ dependencies {
     implementation("com.google.mlkit:text-recognition:16.0.1")
     // ML Kit Object Detection (offline, on-device)
     implementation("com.google.mlkit:object-detection:17.0.2")
-    // TensorFlow Lite Task Vision (for EfficientDet object detection)
-    implementation("org.tensorflow:tensorflow-lite-task-vision:0.4.4")
+    // LiteRT (Google's renamed, actively maintained successor to TensorFlow Lite)
+    implementation("com.google.ai.edge.litert:litert:2.1.5")
 }
